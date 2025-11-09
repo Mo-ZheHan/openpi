@@ -1,0 +1,62 @@
+model:
+  image_channels: 3
+
+  lam_model_dim: 768
+  lam_latent_dim: 128
+  lam_num_latents: 16
+  lam_patch_size: 16
+  lam_enc_blocks: 12
+  lam_dec_blocks: 12
+  lam_num_heads: 12
+
+  vq_beta: 0.25
+  log_interval: 5000
+  log_path: ./logs
+  optimizer:
+    class_path: torch.optim.AdamW
+    init_args:
+      lr: 1e-4
+      weight_decay: 1e-2
+
+  task_name: lam_training
+  make_data_pair: &make_data_pair false
+  stage: stage-1
+
+data:
+  # List of (dataset_repo_id, sampling_weight) pairs
+  # These should be LeRobot dataset repositories (HuggingFace or local)
+  dataset_mix:
+    - ["/home/dengyixuan/mzh/disk/datasets/droid_1.0.1", 1.0]
+    # - ["lerobot/aloha_sim_insertion_scripted", 0.5]
+    # - ["lerobot/pusht", 2.0]
+
+  batch_size: 64
+  resolution: 224
+  image_aug: true
+  buffer_size: 1000   # Buffer size for each StreamingLeRobotDataset (adjust based on memory)
+  seed: 42            # Random seed for reproducibility
+
+trainer:
+  max_epochs: 20
+  accelerator: gpu
+  num_nodes: 1
+  devices: 7
+  strategy: ddp_find_unused_parameters_false
+  precision: 16-mixed
+  log_every_n_steps: 1000
+  gradient_clip_val: 0.1
+
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: ./logs/lam_training
+        verbose: true
+        save_last: true
+        save_top_k: -1
+        every_n_train_steps: 20000
+
+  logger:
+    - class_path: lightning.pytorch.loggers.TensorBoardLogger
+      init_args:
+        save_dir: ./logs
+        name: lam_training
