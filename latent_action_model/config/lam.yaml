@@ -23,12 +23,14 @@ model:
   stage: stage-1
 
 data:
+  root: "/home/dengyixuan/mzh/disk/datasets"
+
   # List of (dataset_repo_id, sampling_weight) pairs
   # These should be LeRobot dataset repositories (HuggingFace or local)
   dataset_mix:
-    - ["/home/dengyixuan/mzh/disk/datasets/droid_1.0.1", 1.0]
-    # - ["lerobot/aloha_sim_insertion_scripted", 0.5]
-    # - ["lerobot/pusht", 2.0]
+    - ["droid", 1.0]
+    # - ["aloha_sim_insertion_scripted", 0.5]
+    # - ["pusht", 2.0]
 
   batch_size: 64
   resolution: 224

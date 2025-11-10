@@ -4,9 +4,12 @@ Main script for training latent action model with LeRobot datasets.
 This script uses Lightning CLI to train the DINO_LAM model with mixed LeRobot datasets.
 """
 
+import torch
 from genie.dataset import LightningLeRobotDataset
 from genie.model import DINO_LAM
 from lightning.pytorch.cli import LightningCLI
+
+torch.set_float32_matmul_precision('high')
 
 
 def cli_main():

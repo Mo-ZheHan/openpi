@@ -40,6 +40,19 @@ DATASETS_WITH_HIGHER_FREQUENCY = [
 ]
 
 
+# Dataset-specific image key mappings
+DATASET_IMAGE_KEYS = {
+    'droid': 'observation.images.exterior_1_left',
+}
+
+
+def get_image_key_for_dataset(dataset_name: str) -> str:
+    for pattern, image_key in DATASET_IMAGE_KEYS.items():
+        if pattern in dataset_name.lower():
+            return image_key
+    raise ValueError(f"No image key found for dataset {dataset_name}")
+
+
 class ImageAugmentation:
     """Image augmentation for training."""
 
@@ -106,20 +119,24 @@ def get_window_size(dataset_name: str, training_phase: str = 'lam') -> int:
     return 10
 
 
-def extract_image_from_sample(sample: Dict[str, Any]) -> Image.Image:
+def extract_image_from_sample(sample: Dict[str, Any], image_key: str = 'observation.image') -> Image.Image:
     """
     Extract image from LeRobot sample and convert to PIL Image.
 
-    Expects 'observation.image' key with tensor in [C, H, W] format.
+    Expects image_key with tensor in [C, H, W] format.
     Will fail explicitly if data format is unexpected.
+
+    Args:
+        sample: Sample dictionary from LeRobot dataset
+        image_key: Key to use for extracting image (default: 'observation.image')
     """
     # Expect specific key - fail if not found
-    if 'observation.image' not in sample:
+    if image_key not in sample:
         raise KeyError(
-            f"Expected 'observation.image' key in sample. Available keys: {list(sample.keys())}"
+            f"Expected '{image_key}' key in sample. Available keys: {list(sample.keys())}"
         )
 
-    img_tensor = sample['observation.image']
+    img_tensor = sample[image_key]
 
     # Convert tensor/array to numpy
     if isinstance(img_tensor, torch.Tensor):
@@ -176,6 +193,7 @@ class InterleavedStreamingDataset(IterableDataset):
         training_phase: str = 'lam',
         buffer_size: int = 1000,
         seed: int = 42,
+        root: Optional[str] = None,
     ):
         """
         Args:
@@ -185,6 +203,7 @@ class InterleavedStreamingDataset(IterableDataset):
             training_phase: Training phase ('lam' or 'post-training')
             buffer_size: Buffer size for each StreamingLeRobotDataset
             seed: Random seed for reproducibility
+            root: Root directory for local datasets (optional)
         """
         super().__init__()
         self.dataset_specs = dataset_specs
@@ -193,11 +212,15 @@ class InterleavedStreamingDataset(IterableDataset):
         self.training_phase = training_phase
         self.buffer_size = buffer_size
         self.seed = seed
+        self.root = root
 
         # Normalize weights
         total_weight = sum(weight for _, weight in dataset_specs)
         self.weights = [weight / total_weight for _, weight in dataset_specs]
         self.repo_ids = [repo_id for repo_id, _ in dataset_specs]
+
+        # Get image keys for each dataset
+        self.image_keys = [get_image_key_for_dataset(repo_id) for repo_id in self.repo_ids]
 
         # Image transforms
         self.to_tensor = transforms.ToTensor()
@@ -215,8 +238,8 @@ class InterleavedStreamingDataset(IterableDataset):
             )
 
         print(f"Interleaved dataset created with {len(self.repo_ids)} datasets")
-        for repo_id, weight in zip(self.repo_ids, self.weights):
-            print(f"  - {repo_id}: weight={weight:.3f}")
+        for repo_id, weight, image_key in zip(self.repo_ids, self.weights, self.image_keys):
+            print(f"  - {repo_id}: weight={weight:.3f}, image_key={image_key}")
 
     def __iter__(self):
         """
@@ -239,8 +262,9 @@ class InterleavedStreamingDataset(IterableDataset):
         # Initialize all streaming datasets
         datasets = []
         iterators = []
+        dataset_image_keys = []  # Track image keys for each dataset
 
-        for repo_id in self.repo_ids:
+        for repo_id, image_key in zip(self.repo_ids, self.image_keys):
             # Determine window size for this dataset
             window_size = get_window_size(repo_id, self.training_phase)
 
@@ -248,20 +272,27 @@ class InterleavedStreamingDataset(IterableDataset):
             # We want [initial_frame, target_frame] where target is window_size-1 steps ahead
             delta_timestamps = {}
 
+            # Construct full path if root is provided
+            dataset_root = None
+            if self.root:
+                from pathlib import Path
+                dataset_root = Path(self.root) / repo_id
+
             # For the primary image, we want current frame (0.0) and future frame
             # LeRobot uses fps from metadata to convert frame indices to time
-            meta = LeRobotDatasetMetadata(repo_id)
+            meta = LeRobotDatasetMetadata(repo_id, root=dataset_root)
             fps = meta.fps
             # Convert frame offset to seconds
             delta_t = (window_size - 1) / fps
             delta_timestamps = {
-                # Get current and future frame
-                "observation.image": [0.0, delta_t],
+                # Get current and future frame using the correct image key for this dataset
+                image_key: [0.0, delta_t],
             }
 
             # Create streaming dataset with shuffle enabled
             dataset = StreamingLeRobotDataset(
                 repo_id=repo_id,
+                root=dataset_root,
                 delta_timestamps=delta_timestamps,
                 streaming=True,
                 buffer_size=self.buffer_size,
@@ -271,12 +302,14 @@ class InterleavedStreamingDataset(IterableDataset):
 
             datasets.append(dataset)
             iterators.append(iter(dataset))
+            dataset_image_keys.append(image_key)
 
         # Interleaved sampling loop
         while True:
             # Randomly select which dataset to sample from based on weights
             dataset_idx = rng.choice(len(datasets), p=self.weights)
             dataset_name = self.repo_ids[dataset_idx]
+            image_key = dataset_image_keys[dataset_idx]
 
             # Get next sample from selected dataset
             try:
@@ -288,32 +321,33 @@ class InterleavedStreamingDataset(IterableDataset):
                 sample = next(iterators[dataset_idx])
 
             # Process the sample
-            yield self._process_sample(sample, dataset_name)
+            yield self._process_sample(sample, dataset_name, image_key)
 
-    def _process_sample(self, sample: Dict[str, Any], dataset_name: str) -> Dict[str, Any]:
+    def _process_sample(self, sample: Dict[str, Any], dataset_name: str, image_key: str) -> Dict[str, Any]:
         """
         Process a sample from LeRobot dataset into the format needed for training.
 
         Args:
             sample: Sample from StreamingLeRobotDataset (contains stacked frames from delta_timestamps)
             dataset_name: Name of the source dataset
+            image_key: The image key used for this dataset (e.g., 'observation.image')
 
         Returns:
             Dictionary with processed frames and actions
         """
         # Extract images - LeRobot with delta_timestamps returns stacked frames
-        # Expected: sample['observation.image'] with shape [2, C, H, W] for initial and target frames
-        if 'observation.image' not in sample:
+        # Expected: sample[image_key] with shape [2, C, H, W] for initial and target frames
+        if image_key not in sample:
             raise KeyError(
-                f"Expected 'observation.image' in sample from {dataset_name}. "
+                f"Expected '{image_key}' in sample from {dataset_name}. "
                 f"Available keys: {list(sample.keys())}"
             )
 
-        img_data = sample['observation.image']
+        img_data = sample[image_key]
 
         if not isinstance(img_data, torch.Tensor):
             raise TypeError(
-                f"Expected torch.Tensor for 'observation.image', got {type(img_data)}"
+                f"Expected torch.Tensor for '{image_key}', got {type(img_data)}"
             )
 
         # Expect exactly 2 frames (initial and target)
@@ -324,8 +358,8 @@ class InterleavedStreamingDataset(IterableDataset):
             )
 
         # Extract initial and target frames
-        initial_img = extract_image_from_sample({'observation.image': img_data[0]})
-        target_img = extract_image_from_sample({'observation.image': img_data[1]})
+        initial_img = extract_image_from_sample({image_key: img_data[0]}, image_key)
+        target_img = extract_image_from_sample({image_key: img_data[1]}, image_key)
 
         # Apply image augmentation
         if self.image_aug is not None:
@@ -438,6 +472,7 @@ class LightningLeRobotDataset(LightningDataModule):
         image_aug: bool = True,
         buffer_size: int = 1000,
         seed: int = 42,
+        root: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -448,6 +483,7 @@ class LightningLeRobotDataset(LightningDataModule):
             image_aug: Whether to apply image augmentation during training
             buffer_size: Buffer size for each StreamingLeRobotDataset
             seed: Random seed for reproducibility
+            root: Root directory for local datasets (optional)
         """
         super().__init__()
 
@@ -457,15 +493,15 @@ class LightningLeRobotDataset(LightningDataModule):
         self.image_aug = image_aug
         self.buffer_size = buffer_size
         self.seed = seed
+        self.root = root
 
         self.train_dataset = None
-        self.val_dataset = None
 
         self.collate_fn = CollatorForLatentAction()
         self.save_hyperparameters()
 
     def setup(self, stage: str) -> None:
-        """Setup datasets for training or validation."""
+        """Setup datasets for training only."""
         if stage == "fit":
             # Create training dataset with augmentation
             self.train_dataset = InterleavedStreamingDataset(
@@ -475,29 +511,10 @@ class LightningLeRobotDataset(LightningDataModule):
                 training_phase='lam',
                 buffer_size=self.buffer_size,
                 seed=self.seed,
+                root=self.root,
             )
 
-            # Create validation dataset without augmentation
-            self.val_dataset = InterleavedStreamingDataset(
-                dataset_specs=self.dataset_mix,
-                resolution=self.resolution,
-                image_aug=False,
-                training_phase='lam',
-                buffer_size=self.buffer_size,
-                seed=self.seed + 1,  # Different seed for validation
-            )
-
-            print("Training and validation datasets initialized (streaming mode)")
-
-        elif stage == "test":
-            self.test_dataset = InterleavedStreamingDataset(
-                dataset_specs=self.dataset_mix,
-                resolution=self.resolution,
-                image_aug=False,
-                training_phase='lam',
-                buffer_size=self.buffer_size,
-                seed=self.seed + 2,  # Different seed for testing
-            )
+            print("Training dataset initialized (streaming mode) - all data used for training")
 
     def train_dataloader(self) -> DataLoader:
         """Create training DataLoader."""
@@ -505,30 +522,6 @@ class LightningLeRobotDataset(LightningDataModule):
             raise RuntimeError("Training dataset not initialized. Call setup('fit') first.")
         return DataLoader(
             self.train_dataset,
-            batch_size=self.batch_size,
-            num_workers=0,  # IterableDataset with internal streaming
-            collate_fn=self.collate_fn,
-            pin_memory=True,
-        )
-
-    def val_dataloader(self) -> DataLoader:
-        """Create validation DataLoader."""
-        if self.val_dataset is None:
-            raise RuntimeError("Validation dataset not initialized. Call setup('fit') first.")
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            num_workers=0,  # IterableDataset with internal streaming
-            collate_fn=self.collate_fn,
-            pin_memory=True,
-        )
-
-    def test_dataloader(self) -> DataLoader:
-        """Create test DataLoader."""
-        if not hasattr(self, 'test_dataset') or self.test_dataset is None:
-            raise RuntimeError("Test dataset not initialized. Call setup('test') first.")
-        return DataLoader(
-            self.test_dataset,
             batch_size=self.batch_size,
             num_workers=0,  # IterableDataset with internal streaming
             collate_fn=self.collate_fn,

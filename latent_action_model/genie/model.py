@@ -84,7 +84,7 @@ class DINO_LAM(LightningModule):
         self.task_name = task_name
         self.distributed_state = PartialState()
         if self.distributed_state.is_main_process:
-            wandb.init(name=task_name, reinit=True)
+            wandb.init(name=task_name, resume='auto')
 
     def shared_step(self, batch: Dict) -> Tuple:
         # batch: keys['videos', 'task_instruction', 'action', 'dataset_names']
